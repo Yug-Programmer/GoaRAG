@@ -1,17 +1,27 @@
 /**
- * BAAI/bge-m3 running in-process via ONNX Runtime (Transformers.js).
+ * Sentence embeddings running in-process via ONNX Runtime (Transformers.js).
  *
- * This is the spec's embedding model. It runs locally rather than through an
- * API because NVIDIA's hosted `baai/bge-m3` NIM currently returns HTTP 500 —
- * see docs/ARCHITECTURE.md. Running locally also removes a network hop from
- * the hot path and makes indexing cost-free.
+ * Local rather than through an API: it removes a network hop from the hot
+ * path — which matters a great deal against a 50ms end-to-end budget, where
+ * a round trip to a hosted embedding endpoint would spend the whole thing —
+ * and makes indexing cost-free. See docs/ARCHITECTURE.md.
  *
- * BGE-M3 is a multilingual (XLM-RoBERTa) model producing 1024-dim dense
- * vectors, which is exactly what a Hindi-query-over-English-passages corpus
- * needs. We use CLS pooling — the pooling method BGE-M3 was trained with;
- * mean pooling measurably degrades its retrieval quality.
+ * The model is not hard-coded. Which encoder, how it pools, and whether it
+ * wants asymmetric query/passage prefixes are all config (see env.ts), because
+ * those three things have to move together: pooling and prefixes are
+ * properties of how a model was *trained*, not preferences, and getting either
+ * wrong silently degrades retrieval instead of failing loudly.
  *
- * Weights are downloaded once into ./models on first use (~542MB at int8).
+ * Two configurations are known-good here:
+ *
+ *   intfloat/multilingual-e5-small  384d  mean  "query: "/"passage: "  (default)
+ *   BAAI/bge-m3                    1024d  cls   no prefixes
+ *
+ * Both are multilingual XLM-RoBERTa encoders, which is what a
+ * Hindi-query-over-English-passages corpus needs. The default is the smaller
+ * one for latency; see docs/LATENCY.md for the measured trade.
+ *
+ * Weights are downloaded once into ./models on first use.
  */
 import path from 'node:path';
 import { config } from '../../config/env.js';
@@ -44,7 +54,7 @@ interface FeatureExtractionPipeline {
   ): Promise<{ dims: number[]; data: Float32Array | number[] }>;
 }
 
-export class LocalBgeM3Provider implements EmbeddingProvider {
+export class LocalOnnxEmbeddingProvider implements EmbeddingProvider {
   readonly name = 'local:onnx';
   readonly model: string;
   readonly dimensions: number;
@@ -52,6 +62,10 @@ export class LocalBgeM3Provider implements EmbeddingProvider {
   private readonly quantization: string;
   private readonly batchSize: number;
   private readonly maxTokens: number;
+  private readonly queryMaxTokens: number;
+  private readonly pooling: 'cls' | 'mean';
+  private readonly queryPrefix: string;
+  private readonly passagePrefix: string;
   private readonly getPipeline: () => Promise<FeatureExtractionPipeline>;
 
   constructor() {
@@ -60,6 +74,10 @@ export class LocalBgeM3Provider implements EmbeddingProvider {
     this.quantization = config.embedding.quantization;
     this.batchSize = config.embedding.batchSize;
     this.maxTokens = config.embedding.maxTokens;
+    this.queryMaxTokens = config.embedding.queryMaxTokens;
+    this.pooling = config.embedding.pooling;
+    this.queryPrefix = normalizePrefix(config.embedding.queryPrefix);
+    this.passagePrefix = normalizePrefix(config.embedding.passagePrefix);
 
     this.getPipeline = once(async () => {
       const { pipeline } = await loadTransformers();
@@ -78,24 +96,47 @@ export class LocalBgeM3Provider implements EmbeddingProvider {
     });
   }
 
+  /**
+   * Warm the model.
+   *
+   * ONNX Runtime allocates its arenas and picks kernels on the first forward
+   * pass, which costs multiples of a steady-state call — so this runs several
+   * passes, not one. Without it the first real query carries that cost and
+   * drags p100 well past the latency budget. Called at boot (index.ts) and
+   * before the benchmark's timed window.
+   */
   async warmup(): Promise<void> {
     const extractor = await this.getPipeline();
-    await extractor(['warmup'], { pooling: 'cls', normalize: true, truncation: true, max_length: 32 });
+    for (let i = 0; i < 3; i += 1) {
+      await extractor([`${this.queryPrefix}warmup`], {
+        pooling: this.pooling,
+        normalize: true,
+        truncation: true,
+        max_length: this.queryMaxTokens,
+      });
+    }
   }
 
   async embed(texts: readonly string[], inputType: EmbeddingInputType): Promise<Float32Array[]> {
     if (texts.length === 0) return [];
     const extractor = await this.getPipeline();
-    const prepared = texts.map((t) => prepareText(t, inputType));
+    const isQuery = inputType === 'query';
+    const prefix = isQuery ? this.queryPrefix : this.passagePrefix;
+    // Transformer cost grows with sequence length, so this window is what
+    // bounds worst-case latency — and a question is not a passage. See
+    // EMBEDDING_QUERY_MAX_TOKENS in env.ts for why the query side is capped
+    // far lower.
+    const maxTokens = isQuery ? this.queryMaxTokens : this.maxTokens;
+    const prepared = texts.map((t) => prepareText(t, prefix, maxTokens));
     const out: Float32Array[] = [];
 
     try {
       for (const batch of chunkArray(prepared, this.batchSize)) {
         const result = await extractor(batch, {
-          pooling: 'cls',
+          pooling: this.pooling,
           normalize: true,
           truncation: true,
-          max_length: this.maxTokens,
+          max_length: maxTokens,
         });
         out.push(...unpackTensor(result, batch.length));
       }
@@ -115,7 +156,10 @@ export class LocalBgeM3Provider implements EmbeddingProvider {
       if (!vector || vector.length !== this.dimensions) {
         return { ok: false, detail: `expected ${this.dimensions} dims, got ${vector?.length ?? 0}` };
       }
-      return { ok: true, detail: `${this.model} (${this.quantization}, ${this.dimensions}d)` };
+      return {
+        ok: true,
+        detail: `${this.model} (${this.quantization}, ${this.dimensions}d, ${this.pooling})`,
+      };
     } catch (error) {
       return { ok: false, detail: (error as Error).message };
     }
@@ -123,27 +167,47 @@ export class LocalBgeM3Provider implements EmbeddingProvider {
 }
 
 /**
- * BGE-M3 asymmetric prefixes.
- *
- * BGE-M3, unlike bge-large-en, was trained *without* an instruction prefix on
- * either side, so adding one hurts. We deliberately pass text through
- * unchanged and only trim runaway inputs.
+ * E5's markers are literally "query: " and "passage: " — the trailing space is
+ * part of the trained string. `.env` parsers strip trailing whitespace off an
+ * unquoted value, so relying on the operator to quote it would mean the prefix
+ * silently degrades to "query:foo" and retrieval quietly gets worse. Restore
+ * it here instead.
  */
-function prepareText(text: string, _inputType: EmbeddingInputType): string {
-  const trimmed = text.trim();
-  if (!trimmed) return ' ';
-  // Guard against pathological inputs; the tokenizer truncates properly but
-  // handing it megabytes of text wastes time before it gets there.
-  const maxChars = 8_000;
-  return trimmed.length > maxChars ? trimmed.slice(0, maxChars) : trimmed;
+function normalizePrefix(prefix: string): string {
+  const trimmed = prefix.trim();
+  return trimmed ? `${trimmed} ` : '';
 }
 
-/** Map a model id to a repo that actually ships ONNX weights. */
+/**
+ * Apply the model's side-specific prefix and clamp runaway inputs.
+ *
+ * The prefix is whatever the configured model was trained with: E5 wants a
+ * literal "query: " / "passage: " marker and loses accuracy without it, BGE
+ * was trained with neither and loses accuracy with one. Both are just config
+ * (see env.ts), so this function stays agnostic.
+ */
+function prepareText(text: string, prefix: string, maxTokens: number): string {
+  const trimmed = text.trim();
+  if (!trimmed) return prefix || ' ';
+  // The tokenizer truncates properly, but it still has to *tokenize* whatever
+  // it is handed first — so clamp the string before it gets there. The bound
+  // is generous against the token window (worst case for these multilingual
+  // SentencePiece vocabularies is roughly one token per character on
+  // Devanagari), so it never cuts text the window would have kept.
+  const maxChars = maxTokens * 8;
+  const clamped = trimmed.length > maxChars ? trimmed.slice(0, maxChars) : trimmed;
+  return prefix ? `${prefix}${clamped}` : clamped;
+}
+
+/** Map a model id to a repo that actually ships Transformers.js ONNX weights. */
 function resolveOnnxRepo(model: string): string {
   const normalized = model.trim();
-  // BAAI's own repo has ONNX but not the Transformers.js layout; the
-  // onnx-community mirror is the canonical converted build.
+  // Neither upstream repo ships the Transformers.js layout; these are the
+  // canonical converted builds.
   if (/^BAAI\/bge-m3$/i.test(normalized)) return 'onnx-community/bge-m3-ONNX';
+  if (/^intfloat\/multilingual-e5-small$/i.test(normalized)) {
+    return 'Xenova/multilingual-e5-small';
+  }
   return normalized;
 }
 

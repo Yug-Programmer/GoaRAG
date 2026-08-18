@@ -24,8 +24,8 @@ import type {
   StreamEvent,
   TokenUsage,
   TranscriptionResult,
-} from '@voxrag/shared';
-import { INSUFFICIENT_EVIDENCE_MESSAGE, LOW_CONFIDENCE_MESSAGE } from '@voxrag/shared';
+} from '@goarag/shared';
+import { INSUFFICIENT_EVIDENCE_MESSAGE, LOW_CONFIDENCE_MESSAGE } from '@goarag/shared';
 import { config } from '../config/env.js';
 import { requestLogger } from '../utils/logger.js';
 import { StageTimer, now } from '../utils/async.js';
@@ -77,7 +77,9 @@ function buildLatency(
     denseRetrieval: timer.get('denseRetrieval'),
     sparseRetrieval: timer.get('sparseRetrieval'),
     fusion: timer.get('fusion'),
+    diversity: timer.get('diversity'),
     reranking: timer.get('reranking'),
+    expansion: timer.get('expansion'),
     promptBuilding: timer.get('promptBuilding'),
     generation: timer.get('generation'),
     guardrailsPost: timer.get('guardrailsPost'),

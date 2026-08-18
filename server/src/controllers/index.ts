@@ -7,17 +7,18 @@
 import type { Request, Response } from 'express';
 import type {
   BenchmarkQuery,
+  DatasetSuggestionsQuery,
   HealthResponse,
   QueryRequest,
   SpeakRequest,
   StatsQuery,
   StreamEvent,
   ComponentHealth,
-} from '@voxrag/shared';
+} from '@goarag/shared';
 import {
   transcribeOptionsSchema,
   voiceQueryOptionsSchema,
-} from '@voxrag/shared';
+} from '@goarag/shared';
 import { config } from '../config/env.js';
 import { AppError, toAppError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
@@ -29,6 +30,7 @@ import { llmHealthCheck } from '../services/llm.service.js';
 import { getIndexStats } from '../services/indexing.service.js';
 import { getAnalytics, uptimeSeconds, recordFailure } from '../services/analytics.service.js';
 import { runBenchmark } from '../services/benchmark.service.js';
+import { getSuggestions } from '../services/suggestions.service.js';
 import { getVectorStore } from '../rag/vector/index.js';
 import { getEmbeddingProvider } from '../rag/embeddings/index.js';
 
@@ -354,6 +356,14 @@ export async function getStats(req: Request, res: Response): Promise<void> {
   const query = validatedQuery<StatsQuery>(req);
   const index = await getIndexStats();
   res.json({ index, analytics: getAnalytics(query.recentLimit) });
+}
+
+// ─── GET /api/dataset/suggestions ────────────────────────────────────────────
+
+export async function getDatasetSuggestions(req: Request, res: Response): Promise<void> {
+  const query = validatedQuery<DatasetSuggestionsQuery>(req);
+  const suggestions = await getSuggestions(query.count);
+  res.json({ suggestions });
 }
 
 // ─── GET /api/benchmark ──────────────────────────────────────────────────────

@@ -7,8 +7,8 @@
  * real work.
  */
 import { ArrowDown, ArrowUp, FileText, Minus, Search } from 'lucide-react';
-import type { RetrievedChunk } from '@voxrag/shared';
-import { languageName } from '@voxrag/shared';
+import type { RetrievedChunk } from '@goarag/shared';
+import { languageName } from '@goarag/shared';
 import { cn, formatPercent, scoreTone, truncateWords } from '@/lib/utils';
 import { Card, CardHeader, CardContent } from '@/components/ui/card';
 import { Badge, EmptyState, Meter, Tooltip } from '@/components/ui/primitives';
@@ -63,7 +63,9 @@ function ChunkRow({ chunk, index }: { chunk: RetrievedChunk; index: number }) {
   const inspected = useSession((state) => state.inspectedChunkId);
   const inspectChunk = useSession((state) => state.inspectChunk);
   const isOpen = inspected === chunk.id;
-  const tone = scoreTone(chunk.score);
+  const rankingScore = chunk.rerankScore ?? chunk.fusedScore;
+  const rankingLabel = chunk.rerankScore === null ? 'Rank' : 'Relevance';
+  const tone = scoreTone(rankingScore);
 
   return (
     <li
@@ -102,17 +104,25 @@ function ChunkRow({ chunk, index }: { chunk: RetrievedChunk; index: number }) {
               ) : null}
               <span className="ml-auto flex items-center gap-2">
                 <RankDelta chunk={chunk} />
-                <span
-                  className={cn(
-                    'font-mono text-xs font-medium',
-                    // Explicit classes — Tailwind cannot see interpolated names.
-                    tone === 'success' && 'text-success',
-                    tone === 'warning' && 'text-warning',
-                    tone === 'danger' && 'text-danger',
-                  )}
+                <Tooltip
+                  content={
+                    chunk.rerankScore === null
+                      ? 'Rank-fusion score used for ordering. Open this chunk to inspect its dense semantic similarity.'
+                      : 'Reranker relevance used for ordering. Open this chunk to inspect its dense semantic similarity.'
+                  }
                 >
-                  {formatPercent(chunk.score, 1)}
-                </span>
+                  <span
+                    className={cn(
+                      'font-mono text-xs font-medium',
+                      // Explicit classes — Tailwind cannot see interpolated names.
+                      tone === 'success' && 'text-success',
+                      tone === 'warning' && 'text-warning',
+                      tone === 'danger' && 'text-danger',
+                    )}
+                  >
+                    {rankingLabel} {formatPercent(rankingScore, 1)}
+                  </span>
+                </Tooltip>
               </span>
             </div>
 
@@ -120,7 +130,9 @@ function ChunkRow({ chunk, index }: { chunk: RetrievedChunk; index: number }) {
               {isOpen ? chunk.text : truncateWords(chunk.text, 34)}
             </p>
 
-            <Meter value={chunk.score} tone={tone} className="mt-2" />
+            {/* The score text above is already tinted by verdict, so the bar
+                carries magnitude — letting two chunks be ranked by eye. */}
+            <Meter value={rankingScore} className="mt-2" />
           </div>
         </div>
       </button>

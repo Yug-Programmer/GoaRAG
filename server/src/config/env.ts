@@ -81,14 +81,14 @@ const envSchema = z.object({
   CORS_ORIGIN: csv,
 
   // Groq (LLM generation)
-  GROQ_API_KEY: z.string().trim().min(1, 'GROQ_API_KEY is required'),
+  GROQ_API_KEY: z.string().trim().default(''),
   GROQ_BASE_URL: stringWithDefault('https://api.groq.com/openai/v1'),
-  GROQ_MODEL: stringWithDefault('llama-3.3-70b-versatile'),
+  GROQ_MODEL: stringWithDefault('openai/gpt-oss-120b'),
   // `reasoning_budget` and `chat_template_kwargs.enable_thinking` (sent when
-  // this is on — see llm.service.ts) are NVIDIA NIM/Nemotron-specific request
-  // fields. Groq's OpenAI-compatible endpoint rejects them outright with a
-  // 400, so this must stay `false` unless GROQ_MODEL is pointed at a NIM
-  // deployment instead.
+  // this is on — see llm.service.ts) are extensions only some gateways accept.
+  // Groq's OpenAI-compatible endpoint rejects them outright with a 400, so this
+  // must stay `false` unless GROQ_BASE_URL points at a gateway that supports
+  // them.
   LLM_ENABLE_THINKING: booleanish(false),
   LLM_TEMPERATURE: floatWithDefault(0.2, 0, 2),
   LLM_TOP_P: floatWithDefault(0.95, 0, 1),
@@ -122,22 +122,61 @@ const envSchema = z.object({
   MAX_AUDIO_UPLOAD_MB: intWithDefault(25, 1, 200),
 
   // Embeddings
-  EMBEDDING_PROVIDER: z.enum(['local', 'nvidia']).default('local'),
-  EMBEDDING_MODEL: stringWithDefault('BAAI/bge-m3'),
-  EMBEDDING_DIMENSIONS: intWithDefault(1024, 64, 8192),
+  //
+  // The default is multilingual-e5-small, not bge-m3, and that choice is
+  // driven entirely by the 50ms end-to-end budget. Measured on this repo's
+  // CPU, warm, one query at a time (see docs/LATENCY.md):
+  //
+  //   bge-m3 (XLM-R large, 1024d)   p50 25.4ms   p100 41.0ms
+  //   multilingual-e5-small (384d)  p50  4.6ms   p100  8.9ms
+  //
+  // bge-m3 alone consumes 82% of the budget at p100 and leaves nothing for
+  // search, fusion and reranking. e5-small is a 12-layer XLM-R with the same
+  // multilingual tokenizer, so Hindi queries still score English passages
+  // correctly, and its smaller vector also makes the dense scan ~2.7× cheaper.
+  // Set EMBEDDING_MODEL=BAAI/bge-m3 (with DIMENSIONS=1024, POOLING=cls, no
+  // prefixes) to trade the budget back for retrieval quality.
+  EMBEDDING_PROVIDER: z.enum(['local']).default('local'),
+  EMBEDDING_MODEL: stringWithDefault('intfloat/multilingual-e5-small'),
+  EMBEDDING_DIMENSIONS: intWithDefault(384, 64, 8192),
   EMBEDDING_BATCH_SIZE: intWithDefault(8, 1, 256),
   EMBEDDING_MAX_TOKENS: intWithDefault(512, 64, 8192),
+  /**
+   * Separate, much smaller window for the query side.
+   *
+   * Transformer cost grows with sequence length, so the token window is what
+   * actually bounds worst-case embedding latency — and a *question* is not a
+   * *passage*. The median query in MSMARCO-XI is 30 characters; a 96-token
+   * window is ~400, comfortably longer than anything a person asks.
+   *
+   * Without this the tail is set by the worst input rather than by design.
+   * One record in the evaluation set is a degenerate 7,783-character
+   * translation loop; it filled the full 512-token window and cost 836ms
+   * against a 19ms median — reproducibly, on every run, single-handedly
+   * failing the p100 budget. Capping the query side leaves real queries
+   * untouched and makes that impossible by construction.
+   */
+  EMBEDDING_QUERY_MAX_TOKENS: intWithDefault(96, 16, 8192),
   EMBEDDING_QUANTIZATION: z.enum(['fp32', 'fp16', 'int8', 'uint8', 'q4', 'q4f16']).default('int8'),
-  // A separate, genuinely-NVIDIA path (EMBEDDING_PROVIDER=nvidia), independent
-  // of whichever provider GROQ_* configures for chat generation — the two
-  // used to share credentials via config.llm, which broke the moment the LLM
-  // endpoint pointed somewhere that isn't NVIDIA NIM.
-  NVIDIA_EMBEDDING_MODEL: stringWithDefault('nvidia/nv-embedqa-e5-v5'),
-  NVIDIA_EMBEDDING_API_KEY: z.string().trim().default(''),
-  NVIDIA_EMBEDDING_BASE_URL: stringWithDefault('https://integrate.api.nvidia.com/v1'),
+  /**
+   * Pooling must match what the model was trained with — this is not a
+   * preference. BGE reads the CLS token; the E5 and sentence-transformers
+   * families mean-pool over the final hidden states. Using the wrong one
+   * silently degrades retrieval rather than failing.
+   */
+  EMBEDDING_POOLING: z.enum(['cls', 'mean']).default('mean'),
+  /**
+   * Asymmetric prefixes. E5 was trained with literal "query: " / "passage: "
+   * markers and loses accuracy without them; BGE was trained with none and
+   * loses accuracy with them. Empty string disables.
+   */
+  EMBEDDING_QUERY_PREFIX: stringWithDefault('query: '),
+  EMBEDDING_PASSAGE_PREFIX: stringWithDefault('passage: '),
 
   // Reranker
-  RERANKER_PROVIDER: z.enum(['local', 'heuristic']).default('local'),
+  // `heuristic` by default: the cross-encoder costs ~1.55s at p50 on CPU,
+  // which dominates the latency budget. See .env.example for measured numbers.
+  RERANKER_PROVIDER: z.enum(['local', 'heuristic']).default('heuristic'),
   RERANKER_MODEL: stringWithDefault('Xenova/bge-reranker-base'),
   RERANKER_QUANTIZATION: z.enum(['fp32', 'fp16', 'int8', 'uint8', 'q4', 'q4f16']).default('int8'),
   RERANK_BATCH_SIZE: intWithDefault(4, 1, 32),
@@ -146,10 +185,43 @@ const envSchema = z.object({
   VECTOR_STORE: z.enum(['qdrant', 'embedded', 'auto']).default('auto'),
   QDRANT_URL: stringWithDefault('http://localhost:6333'),
   QDRANT_API_KEY: z.string().trim().default(''),
-  QDRANT_COLLECTION: stringWithDefault('voxrag_msmarco_xi'),
+  QDRANT_COLLECTION: stringWithDefault('goarag_msmarco_xi'),
   EMBEDDED_STORE_PATH: stringWithDefault('./storage/vectors'),
 
   // Retrieval
+  /**
+   * Hard bound on the query text the retriever will work with.
+   *
+   * Every stage's cost scales with query length — the embedder tokenizes it,
+   * and BM25 walks one posting list per distinct term — so an unbounded query
+   * is an unbounded latency budget. The HTTP schema already caps requests at
+   * 2,000 characters, but enforcing it here too means the bound holds for
+   * every caller (the benchmark reaches `retrieve()` directly) rather than
+   * only for traffic that happened to come through the API.
+   *
+   * 512 is generous: the median MSMARCO-XI query is 30 characters and the
+   * longest genuine one in the evaluation set is 68.
+   */
+  RETRIEVAL_MAX_QUERY_CHARS: intWithDefault(512, 32, 8192),
+  /**
+   * Two-tier retrieval cache (see rag/retriever/cache.ts).
+   *
+   * On by default for the server, where repeated and near-repeated questions
+   * are the common case. The benchmark disables it explicitly: its evaluation
+   * queries are all distinct so it would never hit anyway, and leaving it on
+   * would invite the suspicion that reported percentiles are measuring map
+   * lookups rather than retrieval.
+   */
+  RETRIEVAL_CACHE_ENABLED: booleanish(true),
+  RETRIEVAL_CACHE_MAX_ENTRIES: intWithDefault(256, 8, 10_000),
+  RETRIEVAL_CACHE_TTL_MS: intWithDefault(300_000, 1_000, 86_400_000),
+  /**
+   * Cosine above which two queries are treated as the same question. High on
+   * purpose: 0.97 catches punctuation and phrasing variants, while 0.90 starts
+   * merging genuinely different questions about the same topic and serving one
+   * the other's context.
+   */
+  RETRIEVAL_CACHE_SIMILARITY: floatWithDefault(0.97, 0.5, 1),
   RETRIEVAL_TOP_K: intWithDefault(10, 1, 100),
   RERANK_TOP_N: intWithDefault(5, 1, 50),
   RRF_K: intWithDefault(60, 1, 1000),
@@ -182,10 +254,14 @@ const envSchema = z.object({
   // Dataset
   DATASET_REPO: stringWithDefault('ai4bharat/MSMARCO-XI'),
   DATASET_SPLIT: stringWithDefault('validation'),
-  DATASET_SOURCE: z.enum(['parquet', 'api', 'auto']).default('auto'),
+  // `virtual` reads just the required byte ranges from the remote Parquet file;
+  // it never writes the multi-GB source data to disk.
+  DATASET_SOURCE: z.enum(['virtual', 'parquet', 'api', 'auto']).default('virtual'),
   DATASET_MAX_ROWS: intWithDefault(300, 1, 100_000),
   DATASET_LANGUAGES: csv,
   DATASET_INCLUDE_ENGLISH: booleanish(true),
+  // Keep this off for a fully virtual setup. Vectors remain in the vector store.
+  DATASET_PERSIST_BUNDLE: booleanish(false),
   DATASET_DIR: stringWithDefault('./dataset'),
   INDEX_BATCH_SIZE: intWithDefault(64, 1, 512),
   INDEX_CONCURRENCY: intWithDefault(3, 1, 16),
@@ -201,9 +277,13 @@ const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
   // Fail fast and loudly — a half-configured RAG server is worse than none.
+  const fixHint =
+    process.env.NODE_ENV === 'production'
+      ? 'Set the missing variable(s) above in your host platform\'s dashboard ' +
+        '(e.g. Railway: Service → Variables) and redeploy. There is no .env file in the container.\n\n'
+      : 'Copy .env.example to .env and fill in the required values.\n\n';
   process.stderr.write(
-    `\n✖ Invalid environment configuration:\n${formatIssues(parsed.error)}\n\n` +
-      `Copy .env.example to .env and fill in the required values.\n\n`,
+    `\n✖ Invalid environment configuration:\n${formatIssues(parsed.error)}\n\n${fixHint}`,
   );
   process.exit(1);
 }
@@ -266,10 +346,11 @@ export const config = {
     dimensions: env.EMBEDDING_DIMENSIONS,
     batchSize: env.EMBEDDING_BATCH_SIZE,
     maxTokens: env.EMBEDDING_MAX_TOKENS,
+    queryMaxTokens: env.EMBEDDING_QUERY_MAX_TOKENS,
     quantization: env.EMBEDDING_QUANTIZATION,
-    nvidiaModel: env.NVIDIA_EMBEDDING_MODEL,
-    nvidiaApiKey: env.NVIDIA_EMBEDDING_API_KEY,
-    nvidiaBaseUrl: env.NVIDIA_EMBEDDING_BASE_URL,
+    pooling: env.EMBEDDING_POOLING,
+    queryPrefix: env.EMBEDDING_QUERY_PREFIX,
+    passagePrefix: env.EMBEDDING_PASSAGE_PREFIX,
     cacheDir: resolveFromRoot('./models'),
   },
 
@@ -289,6 +370,13 @@ export const config = {
   },
 
   retrieval: {
+    maxQueryChars: env.RETRIEVAL_MAX_QUERY_CHARS,
+    cache: {
+      enabled: env.RETRIEVAL_CACHE_ENABLED,
+      maxEntries: env.RETRIEVAL_CACHE_MAX_ENTRIES,
+      ttlMs: env.RETRIEVAL_CACHE_TTL_MS,
+      similarity: env.RETRIEVAL_CACHE_SIMILARITY,
+    },
     topK: env.RETRIEVAL_TOP_K,
     rerankTopN: env.RERANK_TOP_N,
     rrfK: env.RRF_K,
@@ -329,6 +417,7 @@ export const config = {
     maxRows: env.DATASET_MAX_ROWS,
     languages: env.DATASET_LANGUAGES,
     includeEnglish: env.DATASET_INCLUDE_ENGLISH,
+    persistBundle: env.DATASET_PERSIST_BUNDLE,
     dir: resolveFromRoot(env.DATASET_DIR),
     batchSize: env.INDEX_BATCH_SIZE,
     concurrency: env.INDEX_CONCURRENCY,
@@ -346,7 +435,7 @@ export function redactedConfig(): Record<string, unknown> {
     llm: { ...config.llm, apiKey: mask(config.llm.apiKey) },
     stt: { ...config.stt, apiKey: mask(config.stt.apiKey) },
     tts: { ...config.tts, apiKey: mask(config.tts.apiKey) },
-    embedding: { ...config.embedding, nvidiaApiKey: mask(config.embedding.nvidiaApiKey) },
+    embedding: config.embedding,
     reranker: config.reranker,
     vectorStore: { ...config.vectorStore, qdrantApiKey: mask(config.vectorStore.qdrantApiKey) },
     retrieval: config.retrieval,

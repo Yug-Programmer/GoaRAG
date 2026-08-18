@@ -20,7 +20,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
-import type { AnswerSource, AnswerStatus, Citation } from '@voxrag/shared';
+import type { AnswerSource, AnswerStatus, Citation } from '@goarag/shared';
 import { copyToClipboard, downloadFile, cn } from '@/lib/utils';
 import { Card, CardHeader, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -331,6 +331,7 @@ export function AnswerPanel() {
 
         {answer ? (
           <div
+            lang={/[\u0900-\u097F]/.test(answer) ? 'hi' : undefined}
             className={cn(
               'text-sm leading-relaxed text-ink',
               isRefusal && 'text-ink-secondary',

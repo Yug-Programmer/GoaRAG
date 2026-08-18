@@ -17,8 +17,8 @@ import {
   Server,
   Activity,
 } from 'lucide-react';
-import type { ComponentHealth } from '@voxrag/shared';
-import { languageName } from '@voxrag/shared';
+import type { ComponentHealth } from '@goarag/shared';
+import { languageName } from '@goarag/shared';
 import { fetchHealth, fetchStats } from '@/lib/api';
 import { cn, formatCompact, formatMs, formatNumber, formatRelative } from '@/lib/utils';
 import { Card, CardHeader, CardContent, StatCard } from '@/components/ui/card';
@@ -143,8 +143,8 @@ export function DashboardPage() {
               title="The index is empty"
               description={
                 <>
-                  Run <code className="font-mono">npm run dataset:download</code> then{' '}
-                  <code className="font-mono">npm run index</code> to populate the vector store.
+                  Run <code className="font-mono">npm run index</code> to read the dataset online
+                  and populate the vector store.
                 </>
               }
             />

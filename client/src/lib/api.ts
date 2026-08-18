@@ -8,6 +8,7 @@
 import type {
   BenchmarkResult,
   ConversationTurn,
+  DatasetSuggestionsResponse,
   HealthResponse,
   QueryResult,
   RetrievalOptions,
@@ -15,7 +16,7 @@ import type {
   StreamEvent,
   TranscriptionResult,
   ApiErrorBody,
-} from '@voxrag/shared';
+} from '@goarag/shared';
 
 /**
  * API origin.
@@ -74,6 +75,10 @@ export function fetchHealth(deep = false): Promise<HealthResponse> {
 
 export function fetchStats(recentLimit = 25): Promise<StatsResponse> {
   return request<StatsResponse>(`/api/stats?recentLimit=${recentLimit}`);
+}
+
+export function fetchSuggestions(count = 2): Promise<DatasetSuggestionsResponse> {
+  return request<DatasetSuggestionsResponse>(`/api/dataset/suggestions?count=${count}`);
 }
 
 export function runBenchmark(params: {
